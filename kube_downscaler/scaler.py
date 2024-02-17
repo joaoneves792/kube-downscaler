@@ -11,6 +11,7 @@ from pykube import Deployment
 from pykube import HorizontalPodAutoscaler
 from pykube import Namespace
 from pykube import StatefulSet
+from pykube import PodDisruptionBudget 
 from pykube.objects import NamespacedAPIObject
 
 from kube_downscaler import helper
@@ -38,6 +39,7 @@ RESOURCE_CLASSES = [
     HorizontalPodAutoscaler,
     ArgoRollout,
     ScaledObject,
+    PodDisruptionBudget,
 ]
 
 TIMESTAMP_FORMATS = [
@@ -148,6 +150,11 @@ def get_replicas(
         logger.debug(
             f"{resource.kind} {resource.namespace}/{resource.name} has {replicas} minReplicas (original: {original_replicas}, uptime: {uptime})"
         )
+    elif resource.kind == "PodDisruptionBudget":
+        replicas = resource.obj["status"]["disruptionsAllowed"]
+        logger.debug(
+            f"{resource.kind} {resource.namespace}/{resource.name} has {replicas} disruptionsAllowed (original: {original_replicas}, uptime: {uptime})"
+        )
     else:
         replicas = resource.replicas
         logger.debug(
@@ -187,6 +194,20 @@ def scale_up(
         logger.info(
             f"Unpausing {resource.kind} {resource.namespace}/{resource.name} (uptime: {uptime}, downtime: {downtime}"
         )
+    elif resource.kind == "PodDisruptionBudget":
+        if "maxUnavailable" in resource.obj["spec"]:
+            resource.obj["spec"]["maxUnavailable"] = original_replicas
+            logger.info(
+                f"Restoring {resource.kind} {resource.namespace}/{resource.name} from {replicas} to {original_replicas} allowed disruptions: maxUnavailable := {original_replicas} (uptime: {uptime}, downtime: {downtime})"
+            )
+            event_message = "Restoring PDB (allowed disruptions = 1) -> (maxUnavailable := {original_replicas})"
+        #elif "minAvailable" in resource.obj["spec"]:
+        else: #if no minAvailable or maxUnavailable is found than at least create a min available so that disruptionsAllowed doesn't end up at 0
+            resource.obj["spec"]["minAvailable"] = original_replicas
+            logger.info(
+                f"Restoring {resource.kind} {resource.namespace}/{resource.name} from {replicas} to {original_replicas} allowed disruptions: minAvailable:= {original_replicas} (uptime: {uptime}, downtime: {downtime})"
+            )
+            event_message = "Restoring PDB (allowed disruptions = 1) -> (minAvailable := {original_replicas})"
     else:
         resource.replicas = original_replicas
         logger.info(
@@ -235,6 +256,26 @@ def scale_down(
             f"Pausing {resource.kind} {resource.namespace}/{resource.name} (uptime: {uptime}, downtime: {downtime}"
         )
         event_message = "Pausing KEDA ScaledObject"
+    elif resource.kind == "PodDisruptionBudget":
+        if "maxUnavailable" in resource.obj["spec"]:
+            replicas = resource.obj["spec"]["maxUnavailable"] #For saving to annotation
+            resource.obj["spec"]["maxUnavailable"] += 1
+            logger.info(
+                f"Fixing {resource.kind} {resource.namespace}/{resource.name} from maxUnavailable: {replicas} to 0 (uptime: {uptime}, downtime: {downtime})"
+            )
+            event_message = "Fixing PDB (maxUnavailable := {resource.obj['spec']['maxUnavailable']})"
+        #elif "minAvailable" in resource.obj["spec"]:
+        else: #if no minAvailable or maxUnavailable is found than at least create a min available so that disruptionsAllowed doesn't end up at 0
+            if "minAvailable" in resource.obj["spec"]:
+                replicas = resource.obj["spec"]["minAvailable"] #For saving to annotation
+            else:
+                replicas = 1 #Assume 1 in cases where the PDB was invalid
+                logger.error(f"{resource.kind} {resource.namespace}/{resource.name} was invalid (no minAvailable or maxUnavailable), forcing minAvailable = 1 for sanity!")
+            resource.obj["spec"]["minAvailable"] = 0
+            logger.info(
+                f"Fixing {resource.kind} {resource.namespace}/{resource.name} minAvailable := 0 (uptime: {uptime}, downtime: {downtime})"
+            )
+            event_message = "Fixing PDB (minAvailable := 0)"
     else:
         resource.replicas = target_replicas
         logger.info(
@@ -340,48 +381,89 @@ def autoscale_resource(
 
             replicas = get_replicas(resource, original_replicas, uptime)
             update_needed = False
-
-            if (
-                not ignore
-                and is_uptime
-                and replicas == downtime_replicas
-                and original_replicas
-                and original_replicas > 0
-            ):
-
-                scale_up(
-                    resource,
-                    replicas,
-                    original_replicas,
-                    uptime,
-                    downtime,
-                    dry_run=dry_run,
-                    enable_events=enable_events,
-                )
-                update_needed = True
-            elif (
-                not ignore
-                and not is_uptime
-                and replicas > 0
-                and replicas > downtime_replicas
-            ):
-                if within_grace_period(
-                    resource, grace_period, now, deployment_time_annotation
+            
+            if ( resource.kind != "PodDisruptionBudget" ):
+                if (
+                    not ignore
+                    and is_uptime
+                    and replicas == downtime_replicas
+                    and original_replicas
+                    and original_replicas > 0
                 ):
-                    logger.info(
-                        f"{resource.kind} {resource.namespace}/{resource.name} within grace period ({grace_period}s), not scaling down (yet)"
-                    )
-                else:
-                    scale_down(
+
+                    scale_up(
                         resource,
                         replicas,
-                        downtime_replicas,
+                        original_replicas,
                         uptime,
                         downtime,
                         dry_run=dry_run,
                         enable_events=enable_events,
                     )
                     update_needed = True
+                elif (
+                    not ignore
+                    and not is_uptime
+                    and replicas > 0
+                    and replicas > downtime_replicas
+                ):
+                    if within_grace_period(
+                        resource, grace_period, now, deployment_time_annotation
+                    ):
+                        logger.info(
+                            f"{resource.kind} {resource.namespace}/{resource.name} within grace period ({grace_period}s), not scaling down (yet)"
+                        )
+                    else:
+                        scale_down(
+                            resource,
+                            replicas,
+                            downtime_replicas,
+                            uptime,
+                            downtime,
+                            dry_run=dry_run,
+                            enable_events=enable_events,
+                        )
+                        update_needed = True
+            elif (resource.kind == "PodDisruptionBudget"):
+                disruptions_allowed = replicas
+                original_disruptions_allowed = original_replicas
+                if (
+                    not ignore
+                    and is_uptime
+                    and original_disruptions_allowed
+                ):
+                    scale_up(
+                        resource,
+                        disruptions_allowed,
+                        original_disruptions_allowed,
+                        uptime,
+                        downtime,
+                        dry_run=dry_run,
+                        enable_events=enable_events,
+                    )
+                    update_needed = True
+                elif (
+                    not ignore
+                    and not is_uptime
+                    and disruptions_allowed == 0
+                ):
+                    if within_grace_period(
+                        resource, grace_period, now, deployment_time_annotation
+                    ):
+                        logger.info(
+                            f"{resource.kind} {resource.namespace}/{resource.name} within grace period ({grace_period}s), not scaling down (yet)"
+                        )
+                    else:
+                        scale_down(
+                            resource,
+                            disruptions_allowed,
+                            downtime_replicas,
+                            uptime,
+                            downtime,
+                            dry_run=dry_run,
+                            enable_events=enable_events,
+                        )
+                        update_needed = True
 
             if update_needed:
                 if dry_run:
