@@ -1,3 +1,17 @@
+### This is a fork from: https://codeberg.org/hjacobs/kube-downscaler
+
+Added features:
+
+- Added support to ensure PDBs in downscaled workloads are safe (allowed disruptions != 0)
+
+Motivation:
+
+I work with some environments that are normally highly available (Deployment+HPA+PDB), but during downtime hours, they can't be completely shutdown either (replicas=0). So we downscale them to 1 replica, however since the PDBs were left with their original values, this would cause problems.
+
+
+Original readme below:
+
+
 Kubernetes Downscaler
 =====================
 
